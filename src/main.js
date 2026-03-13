@@ -11,70 +11,47 @@ export default async ({ req, res, log, error }) => {
   let body = req.bodyJson || {};
   const { databaseId, collectionId, documentIds } = body;
 
-  const snapshots = []; // Store original data for rollback
-  const deletedIds = []; // Track what we successfully deleted
-
   try {
-    if (!Array.isArray(documentIds) || documentIds.length === 0) {
-      throw new Error("No documentIds provided.");
+    if (!databaseId || !collectionId || !Array.isArray(documentIds)) {
+      throw new Error("Missing databaseId, collectionId, or documentIds array.");
     }
 
-    log(`Backing up ${documentIds.length} documents before deletion...`);
+    log(`Starting non-blocking bulk delete for ${documentIds.length} documents...`);
 
-    // 1. Snapshot phase: Get the data so we can restore it if needed
-    for (const id of documentIds) {
-      try {
-        const doc = await databases.getDocument(databaseId, collectionId, id);
-        // Remove Appwrite system fields ($id, $permissions, etc.) before re-insertion
-        const { $id, $createdAt, $updatedAt, $databaseId, $collectionId, $permissions, ...data } = doc;
-        snapshots.push({ id: $id, data, permissions: $permissions });
-      } catch (e) {
-        throw new Error(`Snapshot failed for ${id}: ${e.message}`);
-      }
-    }
+    const BATCH_SIZE = 25;
+    let successCount = 0;
+    const failures = [];
 
-    log("Snapshot complete. Proceeding with deletion...");
+    for (let i = 0; i < documentIds.length; i += BATCH_SIZE) {
+      const chunk = documentIds.slice(i, i + BATCH_SIZE);
 
-    // 2. Deletion phase
-    for (const item of snapshots) {
-      try {
-        await databases.deleteDocument(databaseId, collectionId, item.id);
-        deletedIds.push(item.id);
-      } catch (e) {
-        throw new Error(`Deletion failed for ${item.id}: ${e.message}`);
-      }
-    }
+      const results = await Promise.allSettled(
+        chunk.map(id => databases.deleteDocument(databaseId, collectionId, id))
+      );
 
-    return res.json({ success: true, deletedCount: deletedIds.length }, 200);
-
-  } catch (err) {
-    error(`Transaction failed: ${err.message}. Initializing rollback...`);
-
-    // 3. Rollback phase: Restore the deleted documents
-    const restored = [];
-    for (const item of snapshots) {
-      // Only restore documents that were actually deleted
-      if (deletedIds.includes(item.id)) {
-        try {
-          await databases.createDocument(
-            databaseId,
-            collectionId,
-            item.id,
-            item.data,
-            item.permissions
-          );
-          restored.push(item.id);
-        } catch (reErr) {
-          error(`CRITICAL: Failed to restore document ${item.id}: ${reErr.message}`);
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          successCount++;
+        } else {
+          const id = chunk[index];
+          error(`Failed to delete ${id}: ${result.reason.message}`);
+          failures.push({ id, message: result.reason.message });
         }
-      }
+      });
     }
 
     return res.json({
+      success: failures.length === 0,
+      deletedCount: successCount,
+      failedCount: failures.length,
+      failures: failures
+    }, 200);
+
+  } catch (err) {
+    error(`Bulk delete critical failure: ${err.message}`);
+    return res.json({
       success: false,
-      message: err.message,
-      rolledBack: true,
-      restoredCount: restored.length
+      message: err.message
     }, 500);
   }
 };
