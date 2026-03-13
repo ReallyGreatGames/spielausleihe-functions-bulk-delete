@@ -1,35 +1,80 @@
-import { Client, Users } from 'node-appwrite';
+import { Client, Databases } from 'node-appwrite';
 
-// This Appwrite function will be executed every time your function is triggered
 export default async ({ req, res, log, error }) => {
-  // You can use the Appwrite SDK to interact with other services
-  // For this example, we're using the Users service
   const client = new Client()
     .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
     .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-    .setKey(req.headers['x-appwrite-key'] ?? '');
-  const users = new Users(client);
+    .setKey(process.env.APPWRITE_API_KEY);
+
+  const databases = new Databases(client);
+
+  let body = req.bodyJson || {};
+  const { databaseId, collectionId, documentIds } = body;
+
+  const snapshots = []; // Store original data for rollback
+  const deletedIds = []; // Track what we successfully deleted
 
   try {
-    const response = await users.list();
-    // Log messages and errors to the Appwrite Console
-    // These logs won't be seen by your end users
-    log(`Total users: ${response.total}`);
-  } catch(err) {
-    error("Could not list users: " + err.message);
-  }
+    if (!Array.isArray(documentIds) || documentIds.length === 0) {
+      throw new Error("No documentIds provided.");
+    }
 
-  // The req object contains the request data
-  if (req.path === "/ping") {
-    // Use res object to respond with text(), json(), or binary()
-    // Don't forget to return a response!
-    return res.text("Pong");
-  }
+    log(`Backing up ${documentIds.length} documents before deletion...`);
 
-  return res.json({
-    motto: "Build like a team of hundreds_",
-    learn: "https://appwrite.io/docs",
-    connect: "https://appwrite.io/discord",
-    getInspired: "https://builtwith.appwrite.io",
-  });
+    // 1. Snapshot phase: Get the data so we can restore it if needed
+    for (const id of documentIds) {
+      try {
+        const doc = await databases.getDocument(databaseId, collectionId, id);
+        // Remove Appwrite system fields ($id, $permissions, etc.) before re-insertion
+        const { $id, $createdAt, $updatedAt, $databaseId, $collectionId, $permissions, ...data } = doc;
+        snapshots.push({ id: $id, data, permissions: $permissions });
+      } catch (e) {
+        throw new Error(`Snapshot failed for ${id}: ${e.message}`);
+      }
+    }
+
+    log("Snapshot complete. Proceeding with deletion...");
+
+    // 2. Deletion phase
+    for (const item of snapshots) {
+      try {
+        await databases.deleteDocument(databaseId, collectionId, item.id);
+        deletedIds.push(item.id);
+      } catch (e) {
+        throw new Error(`Deletion failed for ${item.id}: ${e.message}`);
+      }
+    }
+
+    return res.json({ success: true, deletedCount: deletedIds.length }, 200);
+
+  } catch (err) {
+    error(`Transaction failed: ${err.message}. Initializing rollback...`);
+
+    // 3. Rollback phase: Restore the deleted documents
+    const restored = [];
+    for (const item of snapshots) {
+      // Only restore documents that were actually deleted
+      if (deletedIds.includes(item.id)) {
+        try {
+          await databases.createDocument(
+            databaseId,
+            collectionId,
+            item.id,
+            item.data,
+            item.permissions
+          );
+          restored.push(item.id);
+        } catch (reErr) {
+          error(`CRITICAL: Failed to restore document ${item.id}: ${reErr.message}`);
+        }
+      }
+    }
+
+    return res.json({
+      success: false,
+      message: err.message,
+      rolledBack: true,
+      restoredCount: restored.length
+    }, 500);
+  }
 };
