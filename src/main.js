@@ -4,7 +4,10 @@ export default async ({ req, res, log, error }) => {
   const client = new Client()
     .setEndpoint("http://172.17.0.1/v1")
     .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-    .setKey(process.env.APPWRITE_API_KEY);
+    .setKey(process.env.APPWRITE_API_KEY)
+    .addHeader('Origin', 'http://appwrite.reallygreat.games')
+    .addHeader('Host', 'appwrite.reallygreat.games')
+    .setSelfSigned(true);
 
   const databases = new Databases(client);
 
